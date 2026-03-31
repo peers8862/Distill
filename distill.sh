@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Distill — extract lessons from Claude Code session .jsonl files
+# Distill — extract lessons from Claude Code and Codex session files
 #
 # Usage:
 #   distill.sh --list                   # show all known projects with paths
-#   distill.sh                          # all projects
+#   distill.sh                          # all projects (claude + codex)
+#   distill.sh --source claude          # only Claude Code sessions
+#   distill.sh --source codex           # only Codex sessions
 #   distill.sh --project multiterm-codex          # exact project name (basename)
 #   distill.sh --project VENTURES/clark           # path fragment for disambiguation
 #   distill.sh multiterm-codex          # legacy: partial slug match (kept for compat)
 #   distill.sh --dry-run                # preview, no API calls, no writes
 #   distill.sh --file path/to/file.jsonl
+#   distill.sh --file path/to/session.json        # Codex session file
 #
 # Files:
 #   Lessons content : /home/mp/Documents/Lessons/
@@ -20,6 +23,7 @@ set -euo pipefail
 
 LESSONS_DIR="/home/mp/Documents/Lessons"
 PROJECTS_DIR="$HOME/.claude/projects"
+CODEX_SESSIONS_DIR="$HOME/.codex/sessions"
 DISTILL_DIR="$HOME/AI/Claude/myapps/Distill"
 STATE_FILE="$DISTILL_DIR/.distill-state"
 LOG_FILE="$DISTILL_DIR/distill.log"
@@ -32,9 +36,11 @@ SPECIFIC_FILE=""
 PROJECT_FILTER=""   # legacy slug substring
 PROJECT_NAME=""     # --project: basename or path fragment
 LIST_MODE=false
+SOURCE_FILTER="all" # all | claude | codex
 
 # Minimum session size to attempt distillation
-MIN_LINES=50
+MIN_LINES=50        # Claude Code: minimum .jsonl line count
+MIN_CODEX_ITEMS=10  # Codex: minimum conversation items
 # Skip sessions modified more recently than this (seconds) — likely still open
 ACTIVE_THRESHOLD=1800
 
@@ -50,11 +56,17 @@ while [[ $# -gt 0 ]]; do
     --list)     LIST_MODE=true ;;
     --file)     shift; SPECIFIC_FILE="${1:-}" ;;
     --project)  shift; PROJECT_NAME="${1:-}" ;;
+    --source)   shift; SOURCE_FILTER="${1:-all}" ;;
     --*)        echo "Unknown option: $1"; exit 1 ;;
     *)          PROJECT_FILTER="$1" ;;
   esac
   shift
 done
+
+case "$SOURCE_FILTER" in
+  all|claude|codex) ;;
+  *) echo "Unknown --source value: $SOURCE_FILTER (use: all, claude, codex)"; exit 1 ;;
+esac
 
 # ─── Lock — prevent concurrent runs (e.g. two cron overlaps) ─────────────────
 
@@ -242,6 +254,96 @@ with open(sys.argv[1]) as f:
 PYEOF
 }
 
+# ─── Extract conversation content from a Codex session .json file ────────────
+# Codex stores the full conversation (no compaction summaries). We extract
+# user + assistant messages and a compact view of tool calls/outputs.
+
+extract_codex_content() {
+  local file="$1"
+  python3 - "$file" <<'PYEOF'
+import sys, json
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+items = data.get('items', [])
+out = []
+MAX_OUTPUT = 300  # cap tool output verbosity
+
+for item in items:
+    itype = item.get('type', '')
+    if itype == 'message':
+        role = item.get('role', '')
+        content = item.get('content', [])
+        text = ''
+        if isinstance(content, list):
+            parts = []
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                ctype = c.get('type', '')
+                if ctype in ('input_text', 'output_text', 'text'):
+                    parts.append(c.get('text', ''))
+            text = ' '.join(parts).strip()
+        elif isinstance(content, str):
+            text = content.strip()
+        if text:
+            out.append(f"[{role.upper()}]: {text}")
+    elif itype == 'function_call':
+        name = item.get('name', 'tool')
+        args = str(item.get('arguments', ''))[:200]
+        out.append(f"[TOOL {name}]: {args}")
+    elif itype == 'function_call_output':
+        output = str(item.get('output', ''))[:MAX_OUTPUT]
+        if output.strip():
+            out.append(f"[OUTPUT]: {output}")
+    elif itype == 'reasoning':
+        summary = item.get('summary', [])
+        if isinstance(summary, list):
+            text = ' '.join(s.get('text', '') for s in summary if isinstance(s, dict)).strip()
+            if text:
+                out.append(f"[REASONING]: {text[:400]}")
+
+print('\n'.join(out))
+PYEOF
+}
+
+# ─── Extract metadata from a Codex session .json file ────────────────────────
+
+get_codex_meta() {
+  local file="$1"
+  python3 - "$file" <<'PYEOF'
+import sys, json, os
+from datetime import datetime, timezone
+
+file = sys.argv[1]
+with open(file) as f:
+    data = json.load(f)
+
+# Timestamp — stored as unix epoch int or ISO string
+created = data.get('created_at', 0)
+if isinstance(created, (int, float)) and created > 0:
+    date = datetime.fromtimestamp(created, tz=timezone.utc).strftime('%Y-%m-%d')
+elif isinstance(created, str) and created:
+    date = created[:10]
+else:
+    date = 'unknown'
+
+# cwd — may be in top-level, config sub-object, or metadata sub-object
+cwd = (data.get('cwd')
+       or data.get('config', {}).get('cwd')
+       or data.get('metadata', {}).get('cwd'))
+
+project_name = (os.path.basename(cwd.rstrip('/'))
+                if cwd else
+                os.path.splitext(os.path.basename(file))[0])
+
+print(f"project_name:{project_name}")
+print(f"date:{date}")
+print(f"cwd:{cwd or 'unknown'}")
+PYEOF
+}
+
 # ─── Extract session metadata from a .jsonl file ─────────────────────────────
 
 get_meta() {
@@ -285,20 +387,29 @@ safe_name() {
 # ─── Build the distillation prompt ───────────────────────────────────────────
 
 build_prompt() {
-  local project_name="$1" date="$2" cwd="$3" summaries="$4"
+  local project_name="$1" date="$2" cwd="$3" summaries="$4" source="${5:-claude}"
   local existing_patterns
   existing_patterns=$(ls "$LESSONS_DIR/patterns/"*.md 2>/dev/null \
     | xargs -I{} basename {} | tr '\n' ' ' || echo "none yet")
+
+  local source_label summary_label
+  case "$source" in
+    codex)  source_label="Codex (OpenAI)"
+            summary_label="Conversation excerpt (extracted from full Codex session)" ;;
+    *)      source_label="Claude Code"
+            summary_label="Session summary (auto-generated by Claude Code when the context window filled)" ;;
+  esac
 
   cat <<PROMPT
 You are distilling a coding session into structured lesson files for long-term reference.
 
 Session metadata:
+- Tool: $source_label
 - Project: $project_name
 - Path: $cwd
 - Date: $date
 
-Session summary (auto-generated by Claude Code when the context window filled):
+$summary_label:
 ---
 $summaries
 ---
@@ -493,6 +604,135 @@ distill_file() {
   log "  State   : recorded $uuid"
 }
 
+# ─── Distill one Codex .json session file ────────────────────────────────────
+
+distill_codex_file() {
+  local file="$1"
+  local uuid mtime items_count key
+
+  uuid=$(basename "$file" .json)
+  mtime=$(stat -c '%Y' "$file")
+
+  # Count conversation items as a proxy for session depth
+  items_count=$(python3 -c "
+import json, sys
+try:
+    with open('$file') as f:
+        d = json.load(f)
+    print(len(d.get('items', [])))
+except Exception:
+    print(0)
+")
+
+  # Skip sessions still active
+  local age=$(( $(date +%s) - mtime ))
+  if [ "$age" -lt "$ACTIVE_THRESHOLD" ]; then
+    log "  SKIP codex (active, ${age}s ago): $uuid"
+    return 0
+  fi
+
+  # Skip sessions too short
+  if [ "$items_count" -lt "$MIN_CODEX_ITEMS" ]; then
+    log "  SKIP codex (${items_count} items, below minimum ${MIN_CODEX_ITEMS}): $uuid"
+    return 0
+  fi
+
+  # Skip already-processed
+  key=$(state_key "codex:${uuid}" "$mtime" "$items_count")
+  if already_processed "$key"; then
+    log "  SKIP codex (already processed): $uuid"
+    return 0
+  fi
+
+  local content meta project_name date cwd
+  content=$(extract_codex_content "$file")
+  if [ -z "$content" ]; then
+    log "  SKIP codex (no extractable content): $uuid"
+    [ "$DRY_RUN" = false ] && mark_processed "codex:${uuid}" "$mtime" "$items_count" "codex"
+    return 0
+  fi
+
+  meta=$(get_codex_meta "$file")
+  project_name=$(echo "$meta" | grep "^project_name:" | cut -d: -f2-)
+  date=$(echo "$meta"        | grep "^date:"         | cut -d: -f2-)
+  cwd=$(echo "$meta"         | grep "^cwd:"          | cut -d: -f2-)
+
+  log "  Project : $project_name  ($date)  [codex]"
+  log "  Content : $(echo "$content" | wc -c) chars, $items_count items"
+
+  if [ "$DRY_RUN" = true ]; then
+    log "  [dry-run] Would call: claude -p --model $MODEL"
+    echo "$content" | head -15
+    return 0
+  fi
+
+  local filename detail_file prompt output
+  filename=$(safe_name "$project_name")
+  detail_file="$LESSONS_DIR/decisions/${filename}.md"
+
+  log "  Calling claude -p --model $MODEL ..."
+  prompt=$(build_prompt "$project_name" "$date" "$cwd" "$content" "codex")
+  output=$(echo "$prompt" | claude -p --model "$MODEL" 2>/dev/null) || {
+    log "  ERROR: claude -p failed — check API access"
+    return 1
+  }
+
+  if [ -z "$output" ]; then
+    log "  ERROR: Claude returned empty output"
+    return 1
+  fi
+
+  # Split output on markers (identical logic to distill_file)
+  local detail_content patterns_content index_entries
+  detail_content=$(echo "$output" | awk \
+    "/^${MARKER_PATTERNS}\$/{stop=1} !stop{print}")
+  patterns_content=$(echo "$output" | awk \
+    "/^${MARKER_PATTERNS}\$/{in_p=1;next} /^${MARKER_INDEX}\$/{in_p=0} in_p{print}")
+  index_entries=$(echo "$output" | awk \
+    "/^${MARKER_INDEX}\$/{found=1;next} found{print}")
+
+  echo "$detail_content" > "$detail_file"
+  log "  Written : $detail_file"
+
+  local trimmed_patterns
+  trimmed_patterns=$(echo "$patterns_content" | tr -d '[:space:]')
+  if [ -n "$trimmed_patterns" ] && [ "$trimmed_patterns" != "NONE" ]; then
+    local current_target="" block_lines=()
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^TARGET:[[:space:]]*(patterns/[^[:space:]]+)$ ]]; then
+        if [ -n "$current_target" ] && [ ${#block_lines[@]} -gt 0 ]; then
+          _append_pattern "$current_target" "${block_lines[@]}"
+          block_lines=()
+        fi
+        current_target="${BASH_REMATCH[1]}"
+      elif [ -n "$current_target" ] && [ "$line" != "---" ]; then
+        block_lines+=("$line")
+      fi
+    done <<< "$patterns_content"
+    if [ -n "$current_target" ] && [ ${#block_lines[@]} -gt 0 ]; then
+      _append_pattern "$current_target" "${block_lines[@]}"
+    fi
+  else
+    log "  Patterns: none identified"
+  fi
+
+  while IFS= read -r entry; do
+    entry=$(echo "$entry" | sed 's/^[[:space:]]*//')
+    [[ -z "$entry" || "${entry:0:1}" != "-" ]] && continue
+    local link
+    link=$(echo "$entry" | grep -o '([^)]*)' | head -1)
+    if grep -qF "$link" "$LESSONS_DIR/INDEX.md" 2>/dev/null; then
+      log "  Skipped (already indexed): $link"
+    else
+      echo "$entry" >> "$LESSONS_DIR/INDEX.md"
+      log "  Indexed : $entry"
+    fi
+  done <<< "$index_entries"
+
+  mark_processed "codex:${uuid}" "$mtime" "$items_count" "codex"
+  log "  State   : recorded codex:$uuid"
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 # ─── List mode (no lock needed) ───────────────────────────────────────────────
@@ -502,13 +742,18 @@ if [ "$LIST_MODE" = true ]; then
   exit 0
 fi
 
-log "═══ Distill start (dry-run=$DRY_RUN, model=$MODEL)"
+log "═══ Distill start (dry-run=$DRY_RUN, model=$MODEL, source=$SOURCE_FILTER)"
 
 # ─── Single file mode ─────────────────────────────────────────────────────────
 
 if [ -n "$SPECIFIC_FILE" ]; then
   log "File: $SPECIFIC_FILE"
-  distill_file "$SPECIFIC_FILE"
+  # Auto-detect source from file extension
+  if [[ "$SPECIFIC_FILE" == *.json ]]; then
+    distill_codex_file "$SPECIFIC_FILE"
+  else
+    distill_file "$SPECIFIC_FILE"
+  fi
   log "═══ Done"
   exit 0
 fi
@@ -521,27 +766,62 @@ if [ -n "$PROJECT_NAME" ]; then
   log "Resolved --project '$PROJECT_NAME' → slug: $RESOLVED_SLUG"
 fi
 
-# ─── Walk all project directories ─────────────────────────────────────────────
+# ─── Walk Claude Code project directories ─────────────────────────────────────
 
 found=0
 processed=0
-for project_dir in "$PROJECTS_DIR"/*/; do
-  slug=$(basename "$project_dir")
 
-  if [ -n "$RESOLVED_SLUG" ]; then
-    # --project: exact slug match
-    [ "$slug" != "$RESOLVED_SLUG" ] && continue
-  elif [ -n "$PROJECT_FILTER" ]; then
-    # legacy positional arg: substring slug match
-    [[ "$slug" != *"$PROJECT_FILTER"* ]] && continue
-  fi
+if [[ "$SOURCE_FILTER" == "all" || "$SOURCE_FILTER" == "claude" ]]; then
+  for project_dir in "$PROJECTS_DIR"/*/; do
+    slug=$(basename "$project_dir")
 
-  for jsonl_file in "$project_dir"*.jsonl; do
-    [ -f "$jsonl_file" ] || continue
-    found=$((found + 1))
-    log "─── $(basename "$jsonl_file") in $slug"
-    distill_file "$jsonl_file" && processed=$((processed + 1))
+    if [ -n "$RESOLVED_SLUG" ]; then
+      [ "$slug" != "$RESOLVED_SLUG" ] && continue
+    elif [ -n "$PROJECT_FILTER" ]; then
+      [[ "$slug" != *"$PROJECT_FILTER"* ]] && continue
+    fi
+
+    for jsonl_file in "$project_dir"*.jsonl; do
+      [ -f "$jsonl_file" ] || continue
+      found=$((found + 1))
+      log "─── [claude] $(basename "$jsonl_file") in $slug"
+      distill_file "$jsonl_file" && processed=$((processed + 1))
+    done
   done
-done
+fi
+
+# ─── Walk Codex session files ─────────────────────────────────────────────────
+
+if [[ "$SOURCE_FILTER" == "all" || "$SOURCE_FILTER" == "codex" ]]; then
+  if [ -d "$CODEX_SESSIONS_DIR" ]; then
+    for json_file in "$CODEX_SESSIONS_DIR"/*.json; do
+      [ -f "$json_file" ] || continue
+      # --project filter: match against project name extracted from the file
+      if [ -n "$PROJECT_NAME" ] || [ -n "$PROJECT_FILTER" ]; then
+        file_project=$(python3 -c "
+import json, os, sys
+try:
+    with open('$json_file') as f:
+        d = json.load(f)
+    cwd = d.get('cwd') or d.get('config', {}).get('cwd') or ''
+    print(os.path.basename(cwd.rstrip('/')) if cwd else '')
+except Exception:
+    print('')
+" 2>/dev/null)
+        if [ -n "$PROJECT_NAME" ] && [[ "$file_project" != "$PROJECT_NAME"* ]]; then
+          continue
+        fi
+        if [ -n "$PROJECT_FILTER" ] && [[ "$file_project" != *"$PROJECT_FILTER"* ]]; then
+          continue
+        fi
+      fi
+      found=$((found + 1))
+      log "─── [codex] $(basename "$json_file")"
+      distill_codex_file "$json_file" && processed=$((processed + 1))
+    done
+  else
+    [[ "$SOURCE_FILTER" == "codex" ]] && log "NOTE: Codex sessions dir not found: $CODEX_SESSIONS_DIR"
+  fi
+fi
 
 log "═══ Done — $found session(s) examined, $processed processed"
