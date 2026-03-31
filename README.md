@@ -1,8 +1,8 @@
 # Distill
 
-**Distill** automatically extracts reusable lessons from your [Claude Code](https://claude.ai/code) sessions and writes them into structured markdown files for long-term reference.
+**Distill** automatically extracts reusable lessons from your [Claude Code](https://claude.ai/code) and [Codex](https://github.com/openai/codex) sessions and writes them into structured markdown files for long-term reference.
 
-When Claude Code fills its context window, it writes a compaction summary of what happened in the session. Distill harvests those summaries, sends them to Claude (Haiku by default), and produces three kinds of output:
+It harvests session content from both tools, sends it to Claude (Haiku by default), and produces three kinds of output:
 
 - **Decision files** — what was built, key forks taken, failures and their root causes, and next steps
 - **Pattern files** — reusable techniques (library tricks, OS features, idioms) that apply across projects
@@ -12,18 +12,28 @@ When Claude Code fills its context window, it writes a compaction summary of wha
 
 ## How it works
 
+### Claude Code sessions
 1. Claude Code stores every session as a `.jsonl` file under `~/.claude/projects/<slug>/`
 2. When the context window compresses, it writes a structured summary into the session file
-3. `distill.sh` scans those files, extracts any compaction summaries, and skips sessions that are too short, still active, or already processed
-4. It calls `claude -p --model haiku` (non-interactive print mode) with a structured prompt
+3. Distill extracts those compaction summaries and skips sessions that are too short, still active, or already processed
+
+### Codex sessions
+1. Codex stores each session as a `.json` file under `~/.codex/sessions/`
+2. Because Codex keeps the full conversation (no compaction summaries), Distill extracts the message and tool-call content directly
+3. Sessions with fewer than `MIN_CODEX_ITEMS` items are skipped
+
+### Both sources
+4. `distill.sh` calls `claude -p --model haiku` (non-interactive print mode) with a structured prompt labelled with the source tool
 5. The response is parsed and written to `decisions/`, `patterns/`, and `INDEX.md` inside your lessons directory
 
 ---
 
 ## Prerequisites
 
-- **Claude Code CLI** — `claude` must be on your `$PATH` and authenticated  
+- **Claude Code CLI** — `claude` must be on your `$PATH` and authenticated
   Install: https://docs.anthropic.com/claude-code
+- **Codex CLI** *(optional)* — required only if you want to distill Codex sessions
+  Install: https://github.com/openai/codex
 - **bash 4+** and standard POSIX tools (`python3`, `awk`, `stat`, `wc`)
 - A writable lessons directory (see Configuration)
 
@@ -54,20 +64,22 @@ touch ~/Documents/Lessons/INDEX.md
 Open `distill.sh` and update the path variables near the top:
 
 ```bash
-LESSONS_DIR="/home/YOURNAME/Documents/Lessons"   # ← change to your lessons directory
-PROJECTS_DIR="$HOME/.claude/projects"       # ← fine as-is (uses $HOME)
-DISTILL_DIR="$HOME/AI/Claude/myapps/Distill" # ← change to where distill.sh lives
+LESSONS_DIR="/home/YOURNAME/Documents/Lessons"    # ← change to your lessons directory
+PROJECTS_DIR="$HOME/.claude/projects"             # ← fine as-is (Claude Code sessions)
+CODEX_SESSIONS_DIR="$HOME/.codex/sessions"        # ← fine as-is (Codex sessions)
+DISTILL_DIR="$HOME/AI/Claude/myapps/Distill"      # ← change to where distill.sh lives
 ```
 
 > **Note:** `LESSONS_DIR` is currently hardcoded with an absolute path. Update it to match your system before first use.
 
 Other tunables at the top of the script:
 
-| Variable           | Default | Description                                              |
-|--------------------|---------|----------------------------------------------------------|
-| `MODEL`            | `haiku` | Claude model used for distillation (`haiku`, `sonnet`)   |
-| `MIN_LINES`        | `50`    | Minimum session length to attempt distillation           |
-| `ACTIVE_THRESHOLD` | `1800`  | Skip sessions modified less than this many seconds ago   |
+| Variable            | Default | Description                                                      |
+|---------------------|---------|------------------------------------------------------------------|
+| `MODEL`             | `haiku` | Claude model used for distillation (`haiku`, `sonnet`)           |
+| `MIN_LINES`         | `50`    | Claude Code: minimum `.jsonl` line count to attempt distillation |
+| `MIN_CODEX_ITEMS`   | `10`    | Codex: minimum conversation items to attempt distillation        |
+| `ACTIVE_THRESHOLD`  | `1800`  | Skip sessions modified less than this many seconds ago           |
 
 ---
 
@@ -75,6 +87,14 @@ Other tunables at the top of the script:
 
 ```
 distill.sh [OPTIONS] [PROJECT_SLUG]
+```
+
+### Filter by source
+
+```bash
+distill.sh --source claude   # only Claude Code sessions
+distill.sh --source codex    # only Codex sessions
+distill.sh                   # both (default)
 ```
 
 ### List all known projects
@@ -111,7 +131,11 @@ distill.sh --project VENTURES/clark
 ### Distill a single session file
 
 ```bash
+# Claude Code session (.jsonl)
 distill.sh --file ~/.claude/projects/-home-mp-projects-my-api/abc123.jsonl
+
+# Codex session (.json) — source is auto-detected from the extension
+distill.sh --file ~/.codex/sessions/abc123.json
 ```
 
 ### Preview without writing anything
@@ -119,9 +143,10 @@ distill.sh --file ~/.claude/projects/-home-mp-projects-my-api/abc123.jsonl
 ```bash
 distill.sh --dry-run
 distill.sh --dry-run --project my-api
+distill.sh --dry-run --source codex
 ```
 
-`--dry-run` shows which sessions would be processed and prints the first 15 lines of each compaction summary. No Claude API calls are made and no files are written.
+`--dry-run` shows which sessions would be processed and prints the first 15 lines of content. No Claude API calls are made and no files are written.
 
 ---
 
@@ -166,7 +191,12 @@ One-line entries linking to all decisions and pattern files, deduplicated on eac
 
 ## State tracking
 
-Distill records each processed session in `~/.distill-state` (inside the Distill directory). The key is `uuid:mtime:linecount` — if a session file grows (the session was resumed and generated a new compaction), it will be re-processed automatically. Sessions that produce no compaction summary are still marked as seen so they are not rechecked on every run.
+Distill records each processed session in `~/.distill-state` (inside the Distill directory).
+
+- **Claude Code** keys use the format `uuid:mtime:linecount`
+- **Codex** keys use the format `codex:uuid:mtime:itemcount`
+
+If a session file grows (Claude session resumed with a new compaction, or Codex session extended), it will be re-processed automatically. Sessions with no extractable content are still marked as seen so they are not rechecked on every run.
 
 ---
 
@@ -217,7 +247,11 @@ Distill script: ~/AI/Claude/myapps/Distill/distill.sh
 
 ## Troubleshooting
 
-**"No compaction summary"** — the session did not trigger a context compression. Short sessions or sessions that ended before the context filled will not have a summary to distill. This is expected; the session is marked processed and skipped on future runs.
+**"No compaction summary"** (Claude Code) — the session did not trigger a context compression. Short sessions or sessions that ended before the context filled will not have a summary to distill. This is expected; the session is marked processed and skipped on future runs.
+
+**"No extractable content"** (Codex) — the session JSON contained no readable message text. The session is still marked as seen.
+
+**Codex sessions dir not found** — `~/.codex/sessions` does not exist. This is silently skipped when `--source all` (the default). If you explicitly pass `--source codex`, a note is logged.
 
 **"SKIP (active, Xs ago)"** — the session file was modified less than 30 minutes ago, meaning the session may still be open. Run again after closing the session.
 
